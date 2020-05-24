@@ -1,127 +1,78 @@
 #include <cstdlib>
-#include <stack>
-#include <limits>
 
 #include "mysimulator.hh"
 #include "ri.hh"
 
 namespace brown {
 
-void MySimulator::hardwareLoop() {
-    // drawing finished, do nothing
-    static constexpr int ptNum = sizeof(state)/sizeof(state[0]);
-    if (ptIdx >= ptNum) {
-        setpin(clk, false, false, false, false, false);
-        return;
-    }
+	void MySimulator::hardwareLoop() {
+		down = static_cast<bool>(state[row_n][0]);
+		x = state[row_n][1];
+		y = state[row_n][2];
+		row_n += 1;
+		if (down == 0 && x == 0 && y == 0) {
+			setpin(clk, false, false, false, false, false);
+		}
+		else {
+			//change in coords
+			dx = x - xp;
+			dy = y - yp;
+			//calculate pulses
+			np_x = compute_p(dx);
+			np_y = compute_p(dy);
+			if (abs(dx) >= abs(dy)) {
+				longer = true;
+			}
+			else
+				longer = false;
+			//track axis
+			short longer_axis = (longer ? abs(np_x) : abs(np_y));
+			short shorter_axis = (longer ? abs(np_y) : abs(np_x));
 
-    // target location [px]
-    int x = state[ptIdx][1]/scale;
-    int y = state[ptIdx][2]/scale;
-    bool isDown = static_cast<bool>(state[ptIdx][0]);
+			//pulse loop
+			uint64_t iterations = (uint64_t)((double)(abs(longer_axis) - 1) * 100) + 1;
 
-    // relative linear motion
-    int dx = x - locs[0];
-    int dy = y - locs[1];
-    moveLinear(dx, dy, isDown);
+			//track directions
+			if (dx >= 0)
+				dirx = true;
+			else
+				dirx = false;
+			if (dy >= 0)
+				diry = true;
+			else
+				diry = false;
+			
+			uint64_t pulse_step = clk;
+			bool first_half = false;
+			int calc_long1 = -1, calc_short1 = -1;
+			
+			for (uint64_t i = 0; i < iterations; i++) {
+				shorter_pulse = false; longer_pulse = false;
+				calc_long = i / 100;
+				calc_short = (i * shorter_axis) / (longer_axis) / 100;
+				if (calc_long != abs(longer_axis) && calc_long > calc_short1) {
+					longer_pulse = true;
+					calc_short1 = calc_long;
+				}
+				if (calc_short != abs(shorter_axis) && calc_short > calc_long1) {
+					shorter_pulse = true;
+					calc_long1 = calc_short;
+				}
+				pulx = (longer?longer_pulse : shorter_pulse);
+				puly = (longer?shorter_pulse : longer_pulse);
+				if (puly == true || pulx == true) {
+					this->setpin(clk, pulx, puly, dirx, diry, down);
+				}
 
-    // update meta
-    locs[0] = x; locs[1] = y;
-    ptIdx++;
-}
+				//acceleration and deceleration
+				double pulse_rate = acceleration(pulse_step, i, iterations, clk, first_half);
+				clk += (uint64_t)((double)1000000 / (double)(pulse_rate));
+			}
+			//update coords
+			xp = x;
+			yp = y;
+		}
 
-void MySimulator::moveLinear(int dx, int dy, bool isDown) {
-    if (dx == 0 && dy == 0) {
-        return;
-    }
-
-    // direction and displacement
-    bool dirx = (dx > 0);
-    bool diry = (dy > 0);
-    dx = std::abs(dx);
-    dy = std::abs(dy);
-
-    // determine primary/long and secondary/short axis
-    bool isxmain = (dx > dy);
-    int d1px = (isxmain ? dx : dy);
-    int d2px = (isxmain ? dy : dx);
-    bool d2is0 = (d2px == 0);
-
-    // target steps and ratio
-    int d1step = d1px * PULPERPIX;
-    int d2step = d2px * PULPERPIX;
-    float tg = d2is0? -1 : static_cast<float>(d1step)/d2step;
-
-    // step keeping
-    int s1 = 0;
-    int s2 = 0;
-
-    // time keeping
-    std::int64_t startTick = clk;
-    std::int64_t t1 = 0;
-    std::int64_t t2 = d2is0 ? std::numeric_limits<std::int64_t>::max() : 0;
-
-    // speed history
-    std::stack<std::int64_t> vt1s;
-    std::stack<std::int64_t> vt2s;
-
-    while ((s1 < d1step) || (s2 < d2step)) {
-        // determine driving axis
-        bool ismain = (t1 <= t2);
-        int& s = ismain ? s1 : s2;
-        int dstep = ismain ? d1step : d2step;
-        bool isx = (ismain == isxmain);
-        std::int64_t& t = ismain ? t1 : t2;
-        std::stack<std::int64_t>& vts = ismain ? vt1s : vt2s;
-
-        // step
-        clk = startTick + t;
-        setpin(clk, isx, !isx, dirx, diry, isDown);
-        if (++s >= dstep) {
-            t = std::numeric_limits<std::int64_t>::max();
-            continue;
-        }
-
-        // set next step interval
-        std::int64_t vt = 0;
-        if (vts.size() >= (dstep - s)) { // decelerate
-            vt = vts.top();
-            vts.pop();
-        } else if (vts.empty() || (vts.top() > MINT)) { // accelerate
-            vt = linearSpeedCurve(t);
-            if (vt < MINT) { // speeding
-                vt = MINT;
-            }
-            vts.push(vt);
-        } else { // hold
-            vt = MINT;
-        }
-
-        // adjust speed on secondary axis
-        if (!ismain) {
-            vt *= tg;
-        }
-        t += vt;
-    }
-
-    // delay, a time gap between line drawings
-    clk += MAXT;
-    setpin(clk, false, false, dirx, diry, isDown);
-}
-
-std::int64_t MySimulator::linearSpeedCurve(std::int64_t tt) {
-    static std::int64_t r2 = CLKFRQ * CLKFRQ;
-    static std::int64_t rv0 = CLKFRQ * MINVEL;
-    static std::int64_t a = MAXACC*4/5;
-    static std::int64_t lt = MAXT*2; // low speed period
-
-    std::int64_t vt = 0;
-    if (tt < lt) {
-        vt = MAXT;
-    } else {
-        vt = r2/(rv0 + a*(tt-lt));
-    }
-    return vt;
-}
+	}
 
 } // namespace brown
